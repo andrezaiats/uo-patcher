@@ -1,0 +1,770 @@
+#!/usr/bin/env python3
+"""
+UO Classic Client Patcher - Downloads Ultima Online game files from EA/Broadsword patch servers.
+
+The UO Classic Client is freely distributed by EA/Broadsword. This tool downloads the same
+freely available files from the same public, unauthenticated HTTP servers used by the official
+installer. No copy protection, authentication, or encryption is bypassed. Intended for use
+with legitimate UO accounts and community-run shards (e.g. ServUO).
+
+Protocol documented from UOClassicSetup_7_0_24_0.exe (EA Mythic Patcher v6).
+
+Architecture:
+  1. Fetch product file (.prod) from manifest repo - XML describing stages/packages
+  2. Fetch package manifests (pkg.mft) - zlib-compressed XML listing sub-manifests
+  3. Fetch sub-manifests - list individual files with hashes, sizes, compression info
+  4. Download files from file repo using hash-based URLs
+  5. Decompress zlib-compressed files and write to disk
+
+File addressing:
+  - Pack files (*.uop): URL = filerepos/base/<packname>/<ph_08x><sh_08x>
+  - Unpacked files: URL = filerepos/base/unpacked/<hashlittle2(lowercase_filename)>
+  - Hash function: Jenkins hashlittle2 with initval=0
+"""
+
+import argparse
+import os
+import sys
+import struct
+import zlib
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from urllib.request import urlopen, Request
+from urllib.error import HTTPError, URLError
+import time
+import threading
+
+# ---------------------------------------------------------------------------
+# Jenkins hashlittle2 - used by Mythic patcher to hash filenames into 64-bit IDs
+# ---------------------------------------------------------------------------
+
+def _rot(x, k):
+    return ((x << k) | (x >> (32 - k))) & 0xFFFFFFFF
+
+def _mix(a, b, c):
+    a = (a - c) & 0xFFFFFFFF; a ^= _rot(c, 4);  c = (c + b) & 0xFFFFFFFF
+    b = (b - a) & 0xFFFFFFFF; b ^= _rot(a, 6);  a = (a + c) & 0xFFFFFFFF
+    c = (c - b) & 0xFFFFFFFF; c ^= _rot(b, 8);  b = (b + a) & 0xFFFFFFFF
+    a = (a - c) & 0xFFFFFFFF; a ^= _rot(c, 16); c = (c + b) & 0xFFFFFFFF
+    b = (b - a) & 0xFFFFFFFF; b ^= _rot(a, 19); a = (a + c) & 0xFFFFFFFF
+    c = (c - b) & 0xFFFFFFFF; c ^= _rot(b, 4);  b = (b + a) & 0xFFFFFFFF
+    return a, b, c
+
+def _final(a, b, c):
+    c ^= b; c = (c - _rot(b, 14)) & 0xFFFFFFFF
+    a ^= c; a = (a - _rot(c, 11)) & 0xFFFFFFFF
+    b ^= a; b = (b - _rot(a, 25)) & 0xFFFFFFFF
+    c ^= b; c = (c - _rot(b, 16)) & 0xFFFFFFFF
+    a ^= c; a = (a - _rot(c, 4))  & 0xFFFFFFFF
+    b ^= a; b = (b - _rot(a, 14)) & 0xFFFFFFFF
+    c ^= b; c = (c - _rot(b, 24)) & 0xFFFFFFFF
+    return a, b, c
+
+def hashlittle2(data, initval=0, initval2=0):
+    """Jenkins hashlittle2 hash. Returns (primary_hash, secondary_hash) as 32-bit ints."""
+    if isinstance(data, str):
+        data = data.encode('ascii')
+    length = len(data)
+    a = b = c = (0xdeadbeef + length + initval) & 0xFFFFFFFF
+    c = (c + initval2) & 0xFFFFFFFF
+
+    pos = 0
+    while length > 12:
+        a = (a + (data[pos]   | (data[pos+1]<<8) | (data[pos+2]<<16)  | (data[pos+3]<<24)))  & 0xFFFFFFFF
+        b = (b + (data[pos+4] | (data[pos+5]<<8) | (data[pos+6]<<16)  | (data[pos+7]<<24)))  & 0xFFFFFFFF
+        c = (c + (data[pos+8] | (data[pos+9]<<8) | (data[pos+10]<<16) | (data[pos+11]<<24))) & 0xFFFFFFFF
+        a, b, c = _mix(a, b, c)
+        pos += 12
+        length -= 12
+
+    if length > 0:
+        rem = data[pos:pos+length]
+        if length >= 1:  a = (a + rem[0])          & 0xFFFFFFFF
+        if length >= 2:  a = (a + (rem[1] << 8))   & 0xFFFFFFFF
+        if length >= 3:  a = (a + (rem[2] << 16))  & 0xFFFFFFFF
+        if length >= 4:  a = (a + (rem[3] << 24))  & 0xFFFFFFFF
+        if length >= 5:  b = (b + rem[4])           & 0xFFFFFFFF
+        if length >= 6:  b = (b + (rem[5] << 8))    & 0xFFFFFFFF
+        if length >= 7:  b = (b + (rem[6] << 16))   & 0xFFFFFFFF
+        if length >= 8:  b = (b + (rem[7] << 24))   & 0xFFFFFFFF
+        if length >= 9:  c = (c + rem[8])            & 0xFFFFFFFF
+        if length >= 10: c = (c + (rem[9] << 8))     & 0xFFFFFFFF
+        if length >= 11: c = (c + (rem[10] << 16))   & 0xFFFFFFFF
+        if length >= 12: c = (c + (rem[11] << 24))   & 0xFFFFFFFF
+        a, b, c = _final(a, b, c)
+
+    return c, b
+
+
+def filename_hash(name):
+    """Compute the 16-char hex hash used in download URLs for a filename."""
+    h1, h2 = hashlittle2(name.lower())
+    return f"{h1:08x}{h2:08x}"
+
+
+# ---------------------------------------------------------------------------
+# HTTP helpers
+# ---------------------------------------------------------------------------
+
+_print_lock = threading.Lock()
+
+def log(msg):
+    with _print_lock:
+        print(msg, flush=True)
+
+def fetch_bytes(url, retries=3):
+    """Download raw bytes from a URL with retries."""
+    for attempt in range(retries):
+        try:
+            req = Request(url, headers={"User-Agent": "UO Patcher/1.0"})
+            with urlopen(req, timeout=30) as resp:
+                return resp.read()
+        except (HTTPError, URLError, TimeoutError) as e:
+            if attempt == retries - 1:
+                raise
+            time.sleep(1 * (attempt + 1))
+    return b''
+
+def fetch_manifest_xml(url):
+    """Download a zlib-compressed manifest and parse it as XML."""
+    raw = fetch_bytes(url)
+    try:
+        xml_bytes = zlib.decompress(raw)
+    except zlib.error:
+        xml_bytes = raw  # Not compressed
+    return ET.fromstring(xml_bytes.decode('utf-8', errors='replace'))
+
+
+# ---------------------------------------------------------------------------
+# Manifest parsing
+# ---------------------------------------------------------------------------
+
+def parse_prod(url):
+    """Fetch and parse a .prod product file. Returns dict with repos and stages."""
+    log(f"[*] Fetching product file: {url}")
+    raw = fetch_bytes(url)
+    root = ET.fromstring(raw.decode('utf-8'))
+    product = root.find('product')
+
+    manifest_repos = [r.get('url') for r in product.findall('.//manifestrepos/repo')]
+    file_repos = [r.get('url') for r in product.findall('.//filerepos/repo')]
+
+    stages = []
+    for stage_el in product.findall('.//stages/stage'):
+        packages = []
+        for pkg_el in stage_el.findall('.//packages/package'):
+            packages.append({
+                'name': pkg_el.get('name'),
+                'rpath': pkg_el.get('rpath'),
+                'manifest_name': pkg_el.find('manifest').get('n'),
+            })
+        stages.append({
+            'name': stage_el.get('name'),
+            'packages': packages,
+        })
+
+    return {
+        'manifest_repos': manifest_repos,
+        'file_repos': file_repos,
+        'stages': stages,
+        'launchfile': product.get('launchfile'),
+    }
+
+
+def collect_files(manifest_repo, pkg_rpath, manifest_name):
+    """Recursively fetch manifests and collect all file entries.
+
+    Returns two lists: (unpacked_files, pack_files)
+    - unpacked_files: list of dicts with 'name', 'ul', 'ct', 'cl' keys
+    - pack_files: list of dicts with 'pack_name', 'pack_rpath', 'ph', 'sh', 'ul', 'ct', 'cl' keys
+    """
+    url = f"{manifest_repo}{pkg_rpath}/{manifest_name}"
+    log(f"  Fetching manifest: {url}")
+    root = fetch_manifest_xml(url)
+    manifest = root.find('manifest')
+
+    unpacked = []
+    packs = []
+
+    # Direct file entries (unpacked files) - only from <manifest><files>, not <packs><p><files>
+    files_el = manifest.find('files')
+    if files_el is not None:
+        for f in files_el.findall('f'):
+            entry = {
+                'name': f.get('n'),
+                'ul': int(f.get('ul', '0'), 16),
+                'ct': int(f.get('ct', '0')),
+                'cl': int(f.get('cl', '0'), 16),
+            }
+            unpacked.append(entry)
+
+    # Pack file entries
+    for p in manifest.findall('.//packs/p'):
+        pack_name = p.get('name')
+        pack_rpath = p.get('rpath')
+        for f in p.findall('.//files/f'):
+            entry = {
+                'pack_name': pack_name,
+                'pack_rpath': pack_rpath,
+                'ph': f.get('ph'),
+                'sh': f.get('sh'),
+                'ul': int(f.get('ul', '0'), 16),
+                'ct': int(f.get('ct', '0')),
+                'cl': int(f.get('cl', '0'), 16),
+            }
+            packs.append(entry)
+
+    # Sub-manifests (recursive)
+    for sub in manifest.findall('.//manifests/manifest'):
+        sub_name = sub.get('n')
+        sub_unpacked, sub_packs = collect_files(manifest_repo, pkg_rpath, sub_name)
+        unpacked.extend(sub_unpacked)
+        packs.extend(sub_packs)
+
+    return unpacked, packs
+
+
+# ---------------------------------------------------------------------------
+# UOP (MYP) archive index reader - for incremental updates
+# ---------------------------------------------------------------------------
+
+def read_uop_index(path):
+    """Read a .uop archive's file table and return a set of (ph, sh, decompressed_size) tuples.
+
+    UOP on-disk format (from UOFiddler/Mythic-Package-Editor):
+      Header (28 bytes): magic(4) + version(4) + signature(4) + first_block(8) + capacity(4) + count(4)
+      Block header (12 bytes): entry_count(4) + next_block(8)
+      Entry (34 bytes): offset(8) + hdr_len(4) + comp_size(4) + decomp_size(4) + file_hash(8) + data_hash(4) + flag(2)
+
+    The file_hash stores (sh << 32 | ph) — reversed from the manifest's ph:sh naming.
+    The official patcher decompresses data when writing to the archive, so on-disk
+    comp_size == decomp_size and flag == 0 for most entries.
+    """
+    try:
+        fsize = os.path.getsize(path)
+        if fsize < 28:
+            return {}
+    except OSError:
+        return {}
+
+    index = {}
+    with open(path, 'rb') as f:
+        magic = f.read(4)
+        if magic != b'MYP\x00':
+            return {}
+        f.read(4)  # version
+        f.read(4)  # signature
+        first_block = struct.unpack('<q', f.read(8))[0]
+        f.read(4)  # capacity
+        f.read(4)  # count
+
+        block_offset = first_block
+        while 0 < block_offset < fsize:
+            f.seek(block_offset)
+            bc_data = f.read(4)
+            nb_data = f.read(8)
+            if len(bc_data) < 4 or len(nb_data) < 8:
+                break
+            block_count = struct.unpack('<I', bc_data)[0]
+            next_block = struct.unpack('<q', nb_data)[0]
+
+            for _ in range(block_count):
+                raw = f.read(34)
+                if len(raw) < 34:
+                    break
+                data_offset = int.from_bytes(raw[0:8], 'little')
+                decomp_size = int.from_bytes(raw[16:20], 'little')
+                file_hash = int.from_bytes(raw[20:28], 'little')
+                if data_offset == 0 and file_hash == 0:
+                    continue
+                # Convert on-disk hash to manifest (ph, sh) order
+                ph = file_hash & 0xFFFFFFFF
+                sh = (file_hash >> 32) & 0xFFFFFFFF
+                index[(ph, sh)] = decomp_size
+
+            block_offset = next_block
+
+    return index
+
+
+def build_pack_index(output_dir, pack_names):
+    """Read all existing .uop files and build a combined index for skip checking.
+
+    Returns dict: {(pack_name, ph_hex, sh_hex): decompressed_size}
+    """
+    combined = {}
+    for pack_name in pack_names:
+        uop_path = Path(output_dir) / pack_name
+        if not uop_path.exists():
+            continue
+        index = read_uop_index(str(uop_path))
+        for (ph, sh), decomp_size in index.items():
+            combined[(pack_name, f"{ph:x}", f"{sh:x}")] = decomp_size
+    return combined
+
+
+# ---------------------------------------------------------------------------
+# File downloading
+# ---------------------------------------------------------------------------
+
+class ProgressTracker:
+    def __init__(self, total_files, total_bytes):
+        self.total_files = total_files
+        self.total_bytes = total_bytes
+        self.done_files = 0
+        self.done_bytes = 0
+        self.failed = 0
+        self.skipped = 0
+        self._lock = threading.Lock()
+
+    def update(self, nbytes, skipped=False, failed=False):
+        with self._lock:
+            self.done_files += 1
+            self.done_bytes += nbytes
+            if skipped:
+                self.skipped += 1
+            if failed:
+                self.failed += 1
+
+    def status(self):
+        with self._lock:
+            pct = (self.done_bytes / self.total_bytes * 100) if self.total_bytes else 0
+            return (f"  [{self.done_files}/{self.total_files} files] "
+                    f"[{self.done_bytes/1024/1024:.1f}/{self.total_bytes/1024/1024:.1f} MB] "
+                    f"[{pct:.1f}%] "
+                    f"[{self.skipped} skipped, {self.failed} failed]")
+
+
+def download_unpacked_file(file_repo, entry, output_dir, progress):
+    """Download a single unpacked file."""
+    name = entry['name']
+    ct = entry['ct']
+    cl = entry['cl']
+    ul = entry['ul']
+    download_size = cl if ct == 1 else ul
+
+    out_path = Path(output_dir) / name
+    if out_path.exists() and out_path.stat().st_size == ul:
+        progress.update(download_size, skipped=True)
+        return
+
+    h = filename_hash(name)
+    url = f"{file_repo}base/unpacked/{h}"
+
+    try:
+        data = fetch_bytes(url)
+        if ct == 1:
+            data = zlib.decompress(data)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_bytes(data)
+        progress.update(download_size)
+    except Exception as e:
+        log(f"  FAIL: {name} - {e}")
+        progress.update(download_size, failed=True)
+
+
+def download_pack_files(file_repo, pack_entries, output_dir, progress, pack_index=None):
+    """Download pack file entries, skipping entries already in existing .uop archives.
+
+    Args:
+        pack_index: dict from build_pack_index() for skip checking. If None, downloads everything.
+    """
+    # Group by pack name
+    packs = {}
+    for entry in pack_entries:
+        pname = entry['pack_name']
+        if pname not in packs:
+            packs[pname] = []
+        packs[pname].append(entry)
+
+    for pack_name, entries in packs.items():
+        out_path = Path(output_dir) / pack_name
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Check how many need downloading
+        need_download = []
+        for entry in entries:
+            ct = entry['ct']
+            cl = entry['cl']
+            ul = entry['ul']
+            download_size = cl if ct == 1 else ul
+
+            if pack_index is not None:
+                key = (pack_name, entry['ph'], entry['sh'])
+                if key in pack_index and pack_index[key] == ul:
+                    progress.update(download_size, skipped=True)
+                    continue
+            need_download.append(entry)
+
+        if not need_download:
+            log(f"  Pack {pack_name}: {len(entries)} entries, all up-to-date")
+            continue
+
+        log(f"  Downloading pack: {pack_name} ({len(need_download)}/{len(entries)} entries need update)")
+
+        for entry in need_download:
+            ph = int(entry['ph'], 16)
+            sh = int(entry['sh'], 16)
+            ct = entry['ct']
+            cl = entry['cl']
+            ul = entry['ul']
+            download_size = cl if ct == 1 else ul
+            rpath = entry['pack_rpath']
+
+            url = f"{file_repo}base/{rpath}/{ph:08x}{sh:08x}"
+            try:
+                data = fetch_bytes(url)
+                chunk_dir = Path(output_dir) / '.pack_staging' / pack_name
+                chunk_dir.mkdir(parents=True, exist_ok=True)
+                chunk_file = chunk_dir / f"{ph:08x}{sh:08x}"
+                chunk_file.write_bytes(data)
+                progress.update(download_size)
+            except Exception as e:
+                log(f"  FAIL: {pack_name}/{ph:08x}{sh:08x} - {e}")
+                progress.update(download_size, failed=True)
+
+
+def build_myp_archive(output_dir, pack_name, entries):
+    """Build a MYP v5 archive from downloaded chunks.
+
+    MYP format (Mythic Package):
+      Header (24 bytes):
+        - magic: 'MYP\0' (4 bytes)
+        - version: uint32 (5)
+        - misc: uint32
+        - first_table_offset: uint64
+        - file_table_size: uint32 (default 1000)
+        - file_count: uint32
+
+      File Table (linked list of blocks):
+        Each block: array of FileEntry + next_table_offset(uint64)
+        FileEntry (34 bytes):
+          - offset: uint64 (position of data in archive)
+          - header_hash: uint32 (primary hash)
+          - data_hash: uint32 (secondary hash)
+          - compressed_size: uint32
+          - decompressed_size: uint32
+          - compression_type: uint16
+          - ??? : uint16 (usually 0)
+          - metadata_offset: uint32 (relative to data, or 0)
+          - timestamp: uint32
+    """
+    chunk_dir = Path(output_dir) / '.pack_staging' / pack_name
+    if not chunk_dir.exists():
+        return
+
+    out_path = Path(output_dir) / pack_name
+    log(f"  Building MYP archive: {pack_name}")
+
+    # Sort entries by their offset in the original archive
+    sorted_entries = sorted(entries, key=lambda e: int(e['ph'], 16))
+
+    TABLE_ENTRY_SIZE = 34
+    TABLE_BLOCK_SIZE = 1000  # entries per table block
+    HEADER_SIZE = 24
+
+    num_entries = len(sorted_entries)
+    num_table_blocks = (num_entries + TABLE_BLOCK_SIZE - 1) // TABLE_BLOCK_SIZE
+
+    # Calculate space needed for file table
+    table_block_bytes = TABLE_BLOCK_SIZE * TABLE_ENTRY_SIZE + 8  # +8 for next_table_offset
+
+    # Place file data after header, then file tables at end
+    data_offset = HEADER_SIZE
+    file_records = []
+
+    # First pass: assign offsets for file data
+    current_offset = data_offset
+    for entry in sorted_entries:
+        ph = int(entry['ph'], 16)
+        sh = int(entry['sh'], 16)
+        ct = entry['ct']
+        cl = entry['cl']
+        ul = entry['ul']
+        ml = int(entry.get('ml', '0'), 16) if 'ml' in entry else 0
+
+        chunk_file = chunk_dir / f"{ph:08x}{sh:08x}"
+        if chunk_file.exists():
+            chunk_data = chunk_file.read_bytes()
+            compressed_size = len(chunk_data)
+        else:
+            chunk_data = b''
+            compressed_size = 0
+
+        total_block_size = compressed_size + ml  # data + metadata
+
+        file_records.append({
+            'offset': current_offset,
+            'ph': ph,
+            'sh': sh,
+            'compressed_size': compressed_size,
+            'decompressed_size': ul,
+            'compression_type': ct,
+            'metadata_size': ml,
+            'chunk_data': chunk_data,
+        })
+        current_offset += total_block_size
+
+    # File table starts after all data
+    first_table_offset = current_offset
+
+    with open(out_path, 'wb') as f:
+        # Write MYP header
+        f.write(b'MYP\x00')                              # magic
+        f.write(struct.pack('<I', 5))                      # version
+        f.write(struct.pack('<I', 0))                      # misc
+        f.write(struct.pack('<Q', first_table_offset))     # first table offset
+        f.write(struct.pack('<I', TABLE_BLOCK_SIZE))       # table block size
+        f.write(struct.pack('<I', num_entries))             # total file count
+
+        # Write file data
+        for rec in file_records:
+            f.write(rec['chunk_data'])
+            # Write empty metadata placeholder
+            if rec['metadata_size'] > 0:
+                f.write(b'\x00' * rec['metadata_size'])
+
+        # Write file tables
+        idx = 0
+        for block_num in range(num_table_blocks):
+            block_start = idx
+            block_end = min(idx + TABLE_BLOCK_SIZE, num_entries)
+            block_entries = file_records[block_start:block_end]
+
+            for rec in block_entries:
+                f.write(struct.pack('<Q', rec['offset']))
+                f.write(struct.pack('<I', rec['ph']))
+                f.write(struct.pack('<I', rec['sh']))
+                f.write(struct.pack('<I', rec['compressed_size']))
+                f.write(struct.pack('<I', rec['decompressed_size']))
+                f.write(struct.pack('<H', rec['compression_type']))
+                f.write(struct.pack('<H', 0))  # padding
+                f.write(struct.pack('<I', rec['compressed_size']))  # metadata offset (after data)
+                f.write(struct.pack('<I', 0))  # timestamp
+
+            # Pad remaining slots in block
+            remaining = TABLE_BLOCK_SIZE - len(block_entries)
+            f.write(b'\x00' * (remaining * TABLE_ENTRY_SIZE))
+
+            # Next table offset (0 if last block)
+            if block_num < num_table_blocks - 1:
+                next_offset = f.tell() + 8  # after this uint64
+                f.write(struct.pack('<Q', next_offset))
+            else:
+                f.write(struct.pack('<Q', 0))
+
+            idx = block_end
+
+    log(f"  Built {pack_name}: {out_path.stat().st_size / 1024 / 1024:.1f} MB, {num_entries} files")
+
+
+# ---------------------------------------------------------------------------
+# Main patcher logic
+# ---------------------------------------------------------------------------
+
+DEFAULT_PROD_URL = "http://patch.uo.eamythic.com/uopatch-sa/legacyrelease/uo/manifest/uo-legacyrelease.prod"
+
+
+def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, patcher_only=False):
+    """Main entry point: fetch manifests and download all game files."""
+    prod_url = prod_url or DEFAULT_PROD_URL
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Fetch product file
+    prod = parse_prod(prod_url)
+    manifest_repo = prod['manifest_repos'][0]
+    file_repo = prod['file_repos'][0]
+
+    log(f"[*] Manifest repo: {manifest_repo}")
+    log(f"[*] File repo:     {file_repo}")
+    log(f"[*] Launch file:   {prod['launchfile']}")
+    log(f"[*] Stages:        {[s['name'] for s in prod['stages']]}")
+
+    # 2. Collect all files from all stages
+    all_unpacked = []
+    all_packs = []
+
+    for stage in prod['stages']:
+        log(f"\n[*] Processing stage: {stage['name']}")
+        for pkg in stage['packages']:
+            log(f"  Package: {pkg['name']} (rpath={pkg['rpath']})")
+            unpacked, packs = collect_files(manifest_repo, pkg['rpath'], pkg['manifest_name'])
+            all_unpacked.extend(unpacked)
+            all_packs.extend(packs)
+
+    # Compute totals
+    total_unpacked_bytes = sum(e['cl'] if e['ct'] == 1 else e['ul'] for e in all_unpacked)
+    total_pack_bytes = sum(e['cl'] if e['ct'] == 1 else e['ul'] for e in all_packs)
+    total_bytes = total_unpacked_bytes + total_pack_bytes
+    total_files = len(all_unpacked) + len(all_packs)
+
+    # Deduplicate pack files by (pack_name, ph, sh)
+    seen_pack = set()
+    unique_packs = []
+    for e in all_packs:
+        key = (e['pack_name'], e['ph'], e['sh'])
+        if key not in seen_pack:
+            seen_pack.add(key)
+            unique_packs.append(e)
+    all_packs = unique_packs
+
+    log(f"\n{'='*60}")
+    log(f"[*] Total unpacked files: {len(all_unpacked)}")
+    log(f"[*] Total pack entries:   {len(all_packs)}")
+    log(f"[*] Total download size:  {total_bytes/1024/1024:.1f} MB (compressed)")
+    log(f"{'='*60}")
+
+    if dry_run:
+        log("\n[DRY RUN] Would download the above files. Exiting.")
+        return
+
+    # 3. Download unpacked files
+    log(f"\n[*] Downloading {len(all_unpacked)} unpacked files...")
+    progress = ProgressTracker(len(all_unpacked), total_unpacked_bytes)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = []
+        for entry in all_unpacked:
+            fut = pool.submit(download_unpacked_file, file_repo, entry, output_dir, progress)
+            futures.append(fut)
+
+        for i, fut in enumerate(as_completed(futures)):
+            fut.result()  # Raise any exceptions
+            if (i + 1) % 50 == 0 or (i + 1) == len(futures):
+                log(progress.status())
+
+    # 4. Download pack files (with incremental update support)
+    if all_packs:
+        # Build index of existing .uop files for skip checking
+        pack_names = set(e['pack_name'] for e in all_packs)
+        log(f"\n[*] Scanning {len(pack_names)} existing .uop archives for incremental update...")
+        pack_index = build_pack_index(output_dir, pack_names)
+        if pack_index:
+            log(f"  Found {len(pack_index)} existing entries across local archives")
+
+        log(f"[*] Checking {len(all_packs)} pack file entries...")
+        progress = ProgressTracker(len(all_packs), total_pack_bytes)
+        download_pack_files(file_repo, all_packs, output_dir, progress, pack_index)
+        log(progress.status())
+
+        # 5. Build MYP archives only for packs that had updates
+        staging_dir = Path(output_dir) / '.pack_staging'
+        if staging_dir.exists():
+            updated_packs = set(d.name for d in staging_dir.iterdir() if d.is_dir())
+        else:
+            updated_packs = set()
+
+        if updated_packs:
+            log(f"\n[*] Rebuilding {len(updated_packs)} updated MYP archives...")
+            pack_groups = {}
+            for e in all_packs:
+                pname = e['pack_name']
+                if pname in updated_packs:
+                    if pname not in pack_groups:
+                        pack_groups[pname] = []
+                    pack_groups[pname].append(e)
+
+            for pack_name, entries in pack_groups.items():
+                build_myp_archive(output_dir, pack_name, entries)
+        else:
+            log(f"\n[*] All pack archives are up-to-date, no rebuild needed")
+
+    log(f"\n[*] Patch complete! Files written to: {output_dir}")
+
+
+# ---------------------------------------------------------------------------
+# Also download the patcher/client itself
+# ---------------------------------------------------------------------------
+
+PATCHER_PROD_URL = "http://patch.uo.eamythic.com/uopatch-sa/legacyrelease/patcher/manifest/patcher.prod"
+
+
+def run_patcher_download(output_dir, workers=4):
+    """Download the patcher/launcher files (UO.exe, etc.)."""
+    prod = parse_prod(PATCHER_PROD_URL)
+    manifest_repo = prod['manifest_repos'][0]
+    file_repo = prod['file_repos'][0]
+
+    log(f"[*] Patcher manifest repo: {manifest_repo}")
+    log(f"[*] Patcher file repo:     {file_repo}")
+
+    all_unpacked = []
+    all_packs = []
+
+    for stage in prod['stages']:
+        for pkg in stage['packages']:
+            unpacked, packs = collect_files(manifest_repo, pkg['rpath'], pkg['manifest_name'])
+            all_unpacked.extend(unpacked)
+            all_packs.extend(packs)
+
+    log(f"[*] Patcher files: {len(all_unpacked)} unpacked, {len(all_packs)} packed")
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if all_unpacked:
+        total_bytes = sum(e['cl'] if e['ct'] == 1 else e['ul'] for e in all_unpacked)
+        progress = ProgressTracker(len(all_unpacked), total_bytes)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = []
+            for entry in all_unpacked:
+                fut = pool.submit(download_unpacked_file, file_repo, entry, output_dir, progress)
+                futures.append(fut)
+            for fut in as_completed(futures):
+                fut.result()
+        log(progress.status())
+
+    if all_packs:
+        total_pack_bytes = sum(e['cl'] if e['ct'] == 1 else e['ul'] for e in all_packs)
+        progress = ProgressTracker(len(all_packs), total_pack_bytes)
+        download_pack_files(file_repo, all_packs, output_dir, progress)
+        log(progress.status())
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="UO Classic Client Patcher - Download Ultima Online game files from EA patch servers",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s --output ~/UO                    # Download full game to ~/UO
+  %(prog)s --output ~/UO --dry-run           # Show what would be downloaded
+  %(prog)s --output ~/UO --workers 16        # Download with 16 threads
+  %(prog)s --output ~/UO --patcher-only      # Only download the patcher/launcher
+        """)
+    parser.add_argument('-o', '--output', default='./UO_Client',
+                        help='Output directory (default: ./UO_Client)')
+    parser.add_argument('-w', '--workers', type=int, default=8,
+                        help='Number of download threads (default: 8)')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Only show what would be downloaded')
+    parser.add_argument('--patcher-only', action='store_true',
+                        help='Only download patcher/launcher files')
+    parser.add_argument('--prod-url',
+                        help='Override product manifest URL')
+    args = parser.parse_args()
+
+    log("=" * 60)
+    log("  UO Classic Client Patcher")
+    log("  Downloading from EA/Broadsword patch servers")
+    log("=" * 60)
+
+    if args.patcher_only:
+        run_patcher_download(args.output, args.workers)
+    else:
+        # Download patcher first, then game files
+        log("\n[Phase 1] Downloading patcher/launcher...")
+        run_patcher_download(args.output, args.workers)
+
+        log("\n[Phase 2] Downloading game files...")
+        run_patch(args.output, args.prod_url, args.workers, args.dry_run)
+
+
+if __name__ == '__main__':
+    main()
