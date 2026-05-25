@@ -457,12 +457,10 @@ def build_myp_archive(output_dir, pack_name, entries):
     HEADER_SIZE = 28  # magic(4)+version(4)+sig(4)+offset(8)+capacity(4)+count(4)
     BLOCK_HEADER_SIZE = 12  # entry_count(4)+next_block(8)
 
-    num_entries = len(sorted_entries)
-    num_table_blocks = (num_entries + TABLE_BLOCK_SIZE - 1) // TABLE_BLOCK_SIZE
-
     # First pass: read chunks, decompress if needed, compute offsets
     current_offset = HEADER_SIZE
     file_records = []
+    skipped = 0
 
     for entry in sorted_entries:
         ph = int(entry['ph'], 16)
@@ -471,26 +469,40 @@ def build_myp_archive(output_dir, pack_name, entries):
         ul = entry['ul']
 
         chunk_file = chunk_dir / f"{ph:08x}{sh:08x}"
-        if chunk_file.exists():
-            raw_data = chunk_file.read_bytes()
-            if ct == 1:
-                file_data = zlib.decompress(raw_data)
-            else:
-                file_data = raw_data
+        if not chunk_file.exists():
+            log(f"    WARN: missing chunk {ph:08x}{sh:08x} for {pack_name}, skipping entry")
+            skipped += 1
+            continue
+
+        raw_data = chunk_file.read_bytes()
+        if ct == 1:
+            file_data = zlib.decompress(raw_data)
         else:
-            file_data = b''
+            file_data = raw_data
 
         data_size = len(file_data)
+        if data_size != ul:
+            log(f"    WARN: {ph:08x}{sh:08x} size mismatch: got {data_size}, manifest says {ul}")
 
         file_records.append({
             'offset': current_offset,
             'ph': ph,
             'sh': sh,
             'data_size': data_size,
-            'decompressed_size': ul,
+            'decompressed_size': data_size,  # use actual size for both fields
             'file_data': file_data,
         })
         current_offset += data_size
+
+    if skipped:
+        log(f"    {skipped} entries skipped due to missing chunks")
+
+    num_entries = len(file_records)
+    num_table_blocks = (num_entries + TABLE_BLOCK_SIZE - 1) // TABLE_BLOCK_SIZE if num_entries > 0 else 0
+
+    if num_entries == 0:
+        log(f"    ERROR: no valid entries for {pack_name}, skipping archive creation")
+        return
 
     first_table_offset = current_offset
 
@@ -547,13 +559,94 @@ def build_myp_archive(output_dir, pack_name, entries):
 
 
 # ---------------------------------------------------------------------------
+# Verification
+# ---------------------------------------------------------------------------
+
+def verify_archives(output_dir, pack_entries):
+    """Verify built .uop archives against manifest entries.
+
+    Returns (ok_count, missing_count, size_mismatch_count).
+    """
+    output_dir = Path(output_dir)
+    # Group entries by pack name
+    packs = {}
+    for e in pack_entries:
+        pname = e['pack_name']
+        if pname not in packs:
+            packs[pname] = []
+        packs[pname].append(e)
+
+    total_ok = 0
+    total_missing = 0
+    total_mismatch = 0
+
+    for pack_name, entries in packs.items():
+        uop_path = output_dir / pack_name
+        if not uop_path.exists():
+            log(f"  VERIFY FAIL: {pack_name} not found")
+            total_missing += len(entries)
+            continue
+
+        index = read_uop_index(str(uop_path))
+        ok = 0
+        missing = 0
+        mismatch = 0
+
+        for entry in entries:
+            ph = int(entry['ph'], 16)
+            sh = int(entry['sh'], 16)
+            ul = entry['ul']
+
+            if (ph, sh) not in index:
+                missing += 1
+            elif index[(ph, sh)] != ul:
+                mismatch += 1
+            else:
+                ok += 1
+
+        if missing or mismatch:
+            log(f"  VERIFY {pack_name}: {ok} ok, {missing} missing, {mismatch} size mismatch")
+        else:
+            log(f"  VERIFY {pack_name}: {ok}/{len(entries)} entries OK")
+
+        total_ok += ok
+        total_missing += missing
+        total_mismatch += mismatch
+
+    return total_ok, total_missing, total_mismatch
+
+
+def verify_unpacked(output_dir, unpacked_entries):
+    """Verify unpacked files against manifest entries.
+
+    Returns (ok_count, missing_count, size_mismatch_count).
+    """
+    output_dir = Path(output_dir)
+    ok = 0
+    missing = 0
+    mismatch = 0
+
+    for entry in unpacked_entries:
+        path = output_dir / entry['name']
+        ul = entry['ul']
+        if not path.exists():
+            missing += 1
+        elif path.stat().st_size != ul:
+            mismatch += 1
+        else:
+            ok += 1
+
+    return ok, missing, mismatch
+
+
+# ---------------------------------------------------------------------------
 # Main patcher logic
 # ---------------------------------------------------------------------------
 
 DEFAULT_PROD_URL = "http://patch.uo.eamythic.com/uopatch-sa/legacyrelease/uo/manifest/uo-legacyrelease.prod"
 
 
-def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, patcher_only=False):
+def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, patcher_only=False, verify=False):
     """Main entry point: fetch manifests and download all game files."""
     prod_url = prod_url or DEFAULT_PROD_URL
     output_dir = Path(output_dir)
@@ -662,6 +755,20 @@ def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, patcher_only=
         else:
             log(f"\n[*] All pack archives are up-to-date, no rebuild needed")
 
+    # 6. Verify if requested
+    if verify:
+        log(f"\n[*] Verifying downloaded files...")
+        u_ok, u_miss, u_mm = verify_unpacked(output_dir, all_unpacked)
+        log(f"  Unpacked: {u_ok} ok, {u_miss} missing, {u_mm} size mismatch (of {len(all_unpacked)})")
+
+        if all_packs:
+            p_ok, p_miss, p_mm = verify_archives(output_dir, all_packs)
+            log(f"  Pack entries: {p_ok} ok, {p_miss} missing, {p_mm} size mismatch (of {len(all_packs)})")
+
+            if p_miss or p_mm:
+                log(f"\n  WARNING: {p_miss + p_mm} pack entries failed verification!")
+                log(f"  Re-run without --dry-run to re-download failed entries.")
+
     log(f"\n[*] Patch complete! Files written to: {output_dir}")
 
 
@@ -713,6 +820,20 @@ def run_patcher_download(output_dir, workers=4):
         download_pack_files(file_repo, all_packs, output_dir, progress)
         log(progress.status())
 
+        # Build MYP archives for patcher packs
+        staging_dir = Path(output_dir) / '.pack_staging'
+        if staging_dir.exists():
+            pack_groups = {}
+            for e in all_packs:
+                pname = e['pack_name']
+                if pname not in pack_groups:
+                    pack_groups[pname] = []
+                pack_groups[pname].append(e)
+
+            for pack_name, entries in pack_groups.items():
+                build_myp_archive(output_dir, pack_name, entries)
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -737,6 +858,8 @@ Examples:
                         help='Only show what would be downloaded')
     parser.add_argument('--patcher-only', action='store_true',
                         help='Only download patcher/launcher files')
+    parser.add_argument('--verify', action='store_true',
+                        help='Verify archives after download (re-read and compare against manifest)')
     parser.add_argument('--prod-url',
                         help='Override product manifest URL')
     args = parser.parse_args()
@@ -754,7 +877,7 @@ Examples:
         run_patcher_download(args.output, args.workers)
 
         log("\n[Phase 2] Downloading game files...")
-        run_patch(args.output, args.prod_url, args.workers, args.dry_run)
+        run_patch(args.output, args.prod_url, args.workers, args.dry_run, verify=args.verify)
 
 
 if __name__ == '__main__':
