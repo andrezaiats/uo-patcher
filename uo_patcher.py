@@ -32,6 +32,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
+import shutil
 import time
 import threading
 
@@ -428,27 +429,19 @@ def download_pack_files(file_repo, pack_entries, output_dir, progress, pack_inde
 def build_myp_archive(output_dir, pack_name, entries):
     """Build a MYP v5 archive from downloaded chunks.
 
-    MYP format (Mythic Package):
-      Header (24 bytes):
-        - magic: 'MYP\0' (4 bytes)
-        - version: uint32 (5)
-        - misc: uint32
-        - first_table_offset: uint64
-        - file_table_size: uint32 (default 1000)
-        - file_count: uint32
+    MYP format (Mythic Package) — must match read_uop_index():
+      Header (28 bytes):
+        magic(4) + version(4) + signature(4) + first_block(8) + capacity(4) + count(4)
+      File table block:
+        block header (12 bytes): entry_count(4) + next_block_offset(8)
+        followed by up to `capacity` entries (34 bytes each)
+      Entry (34 bytes):
+        data_offset(8) + hdr_len(4) + comp_size(4) + decomp_size(4)
+        + file_hash(8) + adler32(4) + compression_flag(2)
 
-      File Table (linked list of blocks):
-        Each block: array of FileEntry + next_table_offset(uint64)
-        FileEntry (34 bytes):
-          - offset: uint64 (position of data in archive)
-          - header_hash: uint32 (primary hash)
-          - data_hash: uint32 (secondary hash)
-          - compressed_size: uint32
-          - decompressed_size: uint32
-          - compression_type: uint16
-          - ??? : uint16 (usually 0)
-          - metadata_offset: uint32 (relative to data, or 0)
-          - timestamp: uint32
+    The official patcher decompresses data before writing to archives, so on-disk
+    entries have compression_flag=0 and comp_size == decomp_size.
+    The file_hash stores (sh << 32 | ph).
     """
     chunk_dir = Path(output_dir) / '.pack_staging' / pack_name
     if not chunk_dir.exists():
@@ -457,102 +450,96 @@ def build_myp_archive(output_dir, pack_name, entries):
     out_path = Path(output_dir) / pack_name
     log(f"  Building MYP archive: {pack_name}")
 
-    # Sort entries by their offset in the original archive
     sorted_entries = sorted(entries, key=lambda e: int(e['ph'], 16))
 
     TABLE_ENTRY_SIZE = 34
-    TABLE_BLOCK_SIZE = 1000  # entries per table block
-    HEADER_SIZE = 24
+    TABLE_BLOCK_SIZE = 1000
+    HEADER_SIZE = 28  # magic(4)+version(4)+sig(4)+offset(8)+capacity(4)+count(4)
+    BLOCK_HEADER_SIZE = 12  # entry_count(4)+next_block(8)
 
     num_entries = len(sorted_entries)
     num_table_blocks = (num_entries + TABLE_BLOCK_SIZE - 1) // TABLE_BLOCK_SIZE
 
-    # Calculate space needed for file table
-    table_block_bytes = TABLE_BLOCK_SIZE * TABLE_ENTRY_SIZE + 8  # +8 for next_table_offset
-
-    # Place file data after header, then file tables at end
-    data_offset = HEADER_SIZE
+    # First pass: read chunks, decompress if needed, compute offsets
+    current_offset = HEADER_SIZE
     file_records = []
 
-    # First pass: assign offsets for file data
-    current_offset = data_offset
     for entry in sorted_entries:
         ph = int(entry['ph'], 16)
         sh = int(entry['sh'], 16)
         ct = entry['ct']
-        cl = entry['cl']
         ul = entry['ul']
-        ml = int(entry.get('ml', '0'), 16) if 'ml' in entry else 0
 
         chunk_file = chunk_dir / f"{ph:08x}{sh:08x}"
         if chunk_file.exists():
-            chunk_data = chunk_file.read_bytes()
-            compressed_size = len(chunk_data)
+            raw_data = chunk_file.read_bytes()
+            if ct == 1:
+                file_data = zlib.decompress(raw_data)
+            else:
+                file_data = raw_data
         else:
-            chunk_data = b''
-            compressed_size = 0
+            file_data = b''
 
-        total_block_size = compressed_size + ml  # data + metadata
+        data_size = len(file_data)
 
         file_records.append({
             'offset': current_offset,
             'ph': ph,
             'sh': sh,
-            'compressed_size': compressed_size,
+            'data_size': data_size,
             'decompressed_size': ul,
-            'compression_type': ct,
-            'metadata_size': ml,
-            'chunk_data': chunk_data,
+            'file_data': file_data,
         })
-        current_offset += total_block_size
+        current_offset += data_size
 
-    # File table starts after all data
     first_table_offset = current_offset
 
     with open(out_path, 'wb') as f:
-        # Write MYP header
-        f.write(b'MYP\x00')                              # magic
+        # Header (28 bytes)
+        f.write(b'MYP\x00')
         f.write(struct.pack('<I', 5))                      # version
-        f.write(struct.pack('<I', 0))                      # misc
-        f.write(struct.pack('<Q', first_table_offset))     # first table offset
-        f.write(struct.pack('<I', TABLE_BLOCK_SIZE))       # table block size
+        f.write(struct.pack('<I', 0))                      # signature
+        f.write(struct.pack('<q', first_table_offset))     # first table block offset
+        f.write(struct.pack('<I', TABLE_BLOCK_SIZE))       # capacity
         f.write(struct.pack('<I', num_entries))             # total file count
 
-        # Write file data
+        # File data
         for rec in file_records:
-            f.write(rec['chunk_data'])
-            # Write empty metadata placeholder
-            if rec['metadata_size'] > 0:
-                f.write(b'\x00' * rec['metadata_size'])
+            f.write(rec['file_data'])
 
-        # Write file tables
+        # File table blocks
         idx = 0
         for block_num in range(num_table_blocks):
             block_start = idx
             block_end = min(idx + TABLE_BLOCK_SIZE, num_entries)
             block_entries = file_records[block_start:block_end]
 
-            for rec in block_entries:
-                f.write(struct.pack('<Q', rec['offset']))
-                f.write(struct.pack('<I', rec['ph']))
-                f.write(struct.pack('<I', rec['sh']))
-                f.write(struct.pack('<I', rec['compressed_size']))
-                f.write(struct.pack('<I', rec['decompressed_size']))
-                f.write(struct.pack('<H', rec['compression_type']))
-                f.write(struct.pack('<H', 0))  # padding
-                f.write(struct.pack('<I', rec['compressed_size']))  # metadata offset (after data)
-                f.write(struct.pack('<I', 0))  # timestamp
+            # Calculate next block offset before writing
+            # Current pos + block_header(12) + capacity*entry(34) = start of next block
+            if block_num < num_table_blocks - 1:
+                next_block_offset = f.tell() + BLOCK_HEADER_SIZE + TABLE_BLOCK_SIZE * TABLE_ENTRY_SIZE
+            else:
+                next_block_offset = 0
 
-            # Pad remaining slots in block
+            # Block header: entry_count(4) + next_block_offset(8)
+            f.write(struct.pack('<I', len(block_entries)))
+            f.write(struct.pack('<q', next_block_offset))
+
+            # Entries (34 bytes each)
+            for rec in block_entries:
+                file_hash = (rec['sh'] << 32) | rec['ph']
+                adler = zlib.adler32(rec['file_data']) & 0xFFFFFFFF if rec['file_data'] else 0
+                f.write(struct.pack('<q', rec['offset']))          # data offset
+                f.write(struct.pack('<I', 0))                      # header length (0)
+                f.write(struct.pack('<I', rec['data_size']))       # compressed size (== decomp, uncompressed on disk)
+                f.write(struct.pack('<I', rec['decompressed_size']))  # decompressed size
+                f.write(struct.pack('<Q', file_hash))              # file hash (sh<<32 | ph)
+                f.write(struct.pack('<I', adler))                  # adler32 checksum
+                f.write(struct.pack('<h', 0))                      # compression flag (0 = none)
+
+            # Pad remaining slots in block with zeroes
             remaining = TABLE_BLOCK_SIZE - len(block_entries)
             f.write(b'\x00' * (remaining * TABLE_ENTRY_SIZE))
-
-            # Next table offset (0 if last block)
-            if block_num < num_table_blocks - 1:
-                next_offset = f.tell() + 8  # after this uint64
-                f.write(struct.pack('<Q', next_offset))
-            else:
-                f.write(struct.pack('<Q', 0))
 
             idx = block_end
 
@@ -668,6 +655,10 @@ def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, patcher_only=
 
             for pack_name, entries in pack_groups.items():
                 build_myp_archive(output_dir, pack_name, entries)
+
+            # Clean up staging directory
+            shutil.rmtree(staging_dir, ignore_errors=True)
+            log(f"  Cleaned up staging directory")
         else:
             log(f"\n[*] All pack archives are up-to-date, no rebuild needed")
 
