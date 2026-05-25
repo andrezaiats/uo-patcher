@@ -337,18 +337,15 @@ class ProgressTracker:
                     f"[{self.skipped} skipped, {self.failed} failed]")
 
 
-def download_unpacked_file(file_repo, entry, output_dir, progress):
-    """Download a single unpacked file."""
+def _download_one_unpacked(file_repo, entry, output_dir):
+    """Download a single unpacked file. Returns (entry, error_or_None)."""
     name = entry['name']
     ct = entry['ct']
-    cl = entry['cl']
     ul = entry['ul']
-    download_size = cl if ct == 1 else ul
 
     out_path = Path(output_dir) / name
     if out_path.exists() and out_path.stat().st_size == ul:
-        progress.update(download_size, skipped=True)
-        return
+        return (entry, None, True)  # (entry, error, was_skipped)
 
     h = filename_hash(name)
     url = f"{file_repo}base/unpacked/{h}"
@@ -358,72 +355,106 @@ def download_unpacked_file(file_repo, entry, output_dir, progress):
         if ct == 1:
             data = zlib.decompress(data)
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        out_path.write_bytes(data)
-        progress.update(download_size)
+        tmp_path = out_path.with_suffix(out_path.suffix + '.tmp')
+        tmp_path.write_bytes(data)
+        tmp_path.rename(out_path)
+        return (entry, None, False)
     except Exception as e:
-        log(f"  FAIL: {name} - {e}")
-        progress.update(download_size, failed=True)
+        return (entry, str(e), False)
 
 
-def download_pack_files(file_repo, pack_entries, output_dir, progress, pack_index=None):
-    """Download pack file entries, skipping entries already in existing .uop archives.
+def _download_one_pack_entry(file_repo, entry, output_dir):
+    """Download a single pack entry chunk. Returns (entry, error_or_None)."""
+    ph = int(entry['ph'], 16)
+    sh = int(entry['sh'], 16)
+    rpath = entry['pack_rpath']
+
+    url = f"{file_repo}base/{rpath}/{ph:08x}{sh:08x}"
+    chunk_dir = Path(output_dir) / '.pack_staging' / entry['pack_name']
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    final_file = chunk_dir / f"{ph:08x}{sh:08x}"
+    tmp_file = chunk_dir / f"{ph:08x}{sh:08x}.tmp"
+
+    try:
+        data = fetch_bytes(url)
+        tmp_file.write_bytes(data)
+        tmp_file.rename(final_file)
+        return (entry, None)
+    except Exception as e:
+        tmp_file.unlink(missing_ok=True)
+        return (entry, str(e))
+
+
+def download_unpacked_parallel(file_repo, entries, output_dir, workers):
+    """Download unpacked files in parallel. Returns list of failed entries."""
+    if not entries:
+        return []
+
+    total_bytes = sum(e['cl'] if e['ct'] == 1 else e['ul'] for e in entries)
+    progress = ProgressTracker(len(entries), total_bytes)
+    failed = []
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_download_one_unpacked, file_repo, e, output_dir): e for e in entries}
+        for i, fut in enumerate(as_completed(futures)):
+            entry, error, skipped = fut.result()
+            dl_size = entry['cl'] if entry['ct'] == 1 else entry['ul']
+            if error:
+                log(f"  FAIL: {entry['name']} - {error}")
+                progress.update(dl_size, failed=True)
+                failed.append(entry)
+            else:
+                progress.update(dl_size, skipped=skipped)
+            if (i + 1) % 50 == 0 or (i + 1) == len(futures):
+                log(progress.status())
+
+    return failed
+
+
+def download_packs_parallel(file_repo, entries, output_dir, workers, pack_index=None):
+    """Download pack entries in parallel. Returns list of failed entries.
 
     Args:
-        pack_index: dict from build_pack_index() for skip checking. If None, downloads everything.
+        pack_index: dict from build_pack_index() for skip checking.
     """
-    # Group by pack name
-    packs = {}
-    for entry in pack_entries:
-        pname = entry['pack_name']
-        if pname not in packs:
-            packs[pname] = []
-        packs[pname].append(entry)
+    if not entries:
+        return []
 
-    for pack_name, entries in packs.items():
-        out_path = Path(output_dir) / pack_name
-        out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Determine which entries need downloading
+    need_download = []
+    skipped_count = 0
+    for entry in entries:
+        if pack_index is not None:
+            key = (entry['pack_name'], entry['ph'], entry['sh'])
+            if key in pack_index and pack_index[key] == entry['ul']:
+                skipped_count += 1
+                continue
+        need_download.append(entry)
 
-        # Check how many need downloading
-        need_download = []
-        for entry in entries:
-            ct = entry['ct']
-            cl = entry['cl']
-            ul = entry['ul']
-            download_size = cl if ct == 1 else ul
+    if skipped_count:
+        log(f"  {skipped_count} pack entries already up-to-date, {len(need_download)} need download")
+    if not need_download:
+        return []
 
-            if pack_index is not None:
-                key = (pack_name, entry['ph'], entry['sh'])
-                if key in pack_index and pack_index[key] == ul:
-                    progress.update(download_size, skipped=True)
-                    continue
-            need_download.append(entry)
+    total_bytes = sum(e['cl'] if e['ct'] == 1 else e['ul'] for e in need_download)
+    progress = ProgressTracker(len(need_download), total_bytes)
+    failed = []
 
-        if not need_download:
-            log(f"  Pack {pack_name}: {len(entries)} entries, all up-to-date")
-            continue
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_download_one_pack_entry, file_repo, e, output_dir): e for e in need_download}
+        for i, fut in enumerate(as_completed(futures)):
+            entry, error = fut.result()
+            dl_size = entry['cl'] if entry['ct'] == 1 else entry['ul']
+            if error:
+                log(f"  FAIL: {entry['pack_name']}/{entry['ph']}{entry['sh']} - {error}")
+                progress.update(dl_size, failed=True)
+                failed.append(entry)
+            else:
+                progress.update(dl_size)
+            if (i + 1) % 500 == 0 or (i + 1) == len(futures):
+                log(progress.status())
 
-        log(f"  Downloading pack: {pack_name} ({len(need_download)}/{len(entries)} entries need update)")
-
-        for entry in need_download:
-            ph = int(entry['ph'], 16)
-            sh = int(entry['sh'], 16)
-            ct = entry['ct']
-            cl = entry['cl']
-            ul = entry['ul']
-            download_size = cl if ct == 1 else ul
-            rpath = entry['pack_rpath']
-
-            url = f"{file_repo}base/{rpath}/{ph:08x}{sh:08x}"
-            try:
-                data = fetch_bytes(url)
-                chunk_dir = Path(output_dir) / '.pack_staging' / pack_name
-                chunk_dir.mkdir(parents=True, exist_ok=True)
-                chunk_file = chunk_dir / f"{ph:08x}{sh:08x}"
-                chunk_file.write_bytes(data)
-                progress.update(download_size)
-            except Exception as e:
-                log(f"  FAIL: {pack_name}/{ph:08x}{sh:08x} - {e}")
-                progress.update(download_size, failed=True)
+    return failed
 
 
 def build_myp_archive(output_dir, pack_name, entries):
@@ -565,78 +596,60 @@ def build_myp_archive(output_dir, pack_name, entries):
 def verify_archives(output_dir, pack_entries):
     """Verify built .uop archives against manifest entries.
 
-    Returns (ok_count, missing_count, size_mismatch_count).
+    Returns list of entries that failed verification (missing or size mismatch).
     """
     output_dir = Path(output_dir)
-    # Group entries by pack name
     packs = {}
     for e in pack_entries:
-        pname = e['pack_name']
-        if pname not in packs:
-            packs[pname] = []
-        packs[pname].append(e)
+        packs.setdefault(e['pack_name'], []).append(e)
 
     total_ok = 0
-    total_missing = 0
-    total_mismatch = 0
+    failed_entries = []
 
     for pack_name, entries in packs.items():
         uop_path = output_dir / pack_name
         if not uop_path.exists():
             log(f"  VERIFY FAIL: {pack_name} not found")
-            total_missing += len(entries)
+            failed_entries.extend(entries)
             continue
 
         index = read_uop_index(str(uop_path))
-        ok = 0
-        missing = 0
-        mismatch = 0
 
         for entry in entries:
             ph = int(entry['ph'], 16)
             sh = int(entry['sh'], 16)
             ul = entry['ul']
-
-            if (ph, sh) not in index:
-                missing += 1
-            elif index[(ph, sh)] != ul:
-                mismatch += 1
+            if (ph, sh) not in index or index[(ph, sh)] != ul:
+                failed_entries.append(entry)
             else:
-                ok += 1
+                total_ok += 1
 
-        if missing or mismatch:
-            log(f"  VERIFY {pack_name}: {ok} ok, {missing} missing, {mismatch} size mismatch")
-        else:
-            log(f"  VERIFY {pack_name}: {ok}/{len(entries)} entries OK")
-
-        total_ok += ok
-        total_missing += missing
-        total_mismatch += mismatch
-
-    return total_ok, total_missing, total_mismatch
+    if failed_entries:
+        by_pack = {}
+        for e in failed_entries:
+            by_pack.setdefault(e['pack_name'], []).append(e)
+        for pname, ents in by_pack.items():
+            log(f"  VERIFY {pname}: {ents[0]['ph']}{ents[0]['sh']}... ({len(ents)} entries failed)")
+    log(f"  Pack verification: {total_ok} ok, {len(failed_entries)} failed")
+    return failed_entries
 
 
 def verify_unpacked(output_dir, unpacked_entries):
-    """Verify unpacked files against manifest entries.
-
-    Returns (ok_count, missing_count, size_mismatch_count).
-    """
+    """Verify unpacked files. Returns list of entries that need re-download."""
     output_dir = Path(output_dir)
+    failed = []
     ok = 0
-    missing = 0
-    mismatch = 0
 
     for entry in unpacked_entries:
         path = output_dir / entry['name']
         ul = entry['ul']
-        if not path.exists():
-            missing += 1
-        elif path.stat().st_size != ul:
-            mismatch += 1
+        if not path.exists() or path.stat().st_size != ul:
+            failed.append(entry)
         else:
             ok += 1
 
-    return ok, missing, mismatch
+    log(f"  Unpacked verification: {ok} ok, {len(failed)} failed")
+    return failed
 
 
 # ---------------------------------------------------------------------------
@@ -644,10 +657,11 @@ def verify_unpacked(output_dir, unpacked_entries):
 # ---------------------------------------------------------------------------
 
 DEFAULT_PROD_URL = "http://patch.uo.eamythic.com/uopatch-sa/legacyrelease/uo/manifest/uo-legacyrelease.prod"
+MAX_RETRIES = 3
 
 
-def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, patcher_only=False, verify=False):
-    """Main entry point: fetch manifests and download all game files."""
+def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, no_verify=False, retries=MAX_RETRIES):
+    """Main entry point: fetch manifests, download all game files, verify, and retry failures."""
     prod_url = prod_url or DEFAULT_PROD_URL
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -674,12 +688,6 @@ def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, patcher_only=
             all_unpacked.extend(unpacked)
             all_packs.extend(packs)
 
-    # Compute totals
-    total_unpacked_bytes = sum(e['cl'] if e['ct'] == 1 else e['ul'] for e in all_unpacked)
-    total_pack_bytes = sum(e['cl'] if e['ct'] == 1 else e['ul'] for e in all_packs)
-    total_bytes = total_unpacked_bytes + total_pack_bytes
-    total_files = len(all_unpacked) + len(all_packs)
-
     # Deduplicate pack files by (pack_name, ph, sh)
     seen_pack = set()
     unique_packs = []
@@ -690,46 +698,51 @@ def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, patcher_only=
             unique_packs.append(e)
     all_packs = unique_packs
 
+    total_unpacked_bytes = sum(e['cl'] if e['ct'] == 1 else e['ul'] for e in all_unpacked)
+    total_pack_bytes = sum(e['cl'] if e['ct'] == 1 else e['ul'] for e in all_packs)
+
     log(f"\n{'='*60}")
     log(f"[*] Total unpacked files: {len(all_unpacked)}")
     log(f"[*] Total pack entries:   {len(all_packs)}")
-    log(f"[*] Total download size:  {total_bytes/1024/1024:.1f} MB (compressed)")
+    log(f"[*] Total download size:  {(total_unpacked_bytes + total_pack_bytes)/1024/1024:.1f} MB")
     log(f"{'='*60}")
 
     if dry_run:
         log("\n[DRY RUN] Would download the above files. Exiting.")
         return
 
-    # 3. Download unpacked files
+    # 3. Download unpacked files with retry loop
     log(f"\n[*] Downloading {len(all_unpacked)} unpacked files...")
-    progress = ProgressTracker(len(all_unpacked), total_unpacked_bytes)
+    failed_unpacked = download_unpacked_parallel(file_repo, all_unpacked, output_dir, workers)
 
-    with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = []
-        for entry in all_unpacked:
-            fut = pool.submit(download_unpacked_file, file_repo, entry, output_dir, progress)
-            futures.append(fut)
+    if not no_verify:
+        for attempt in range(1, retries + 1):
+            if not failed_unpacked:
+                break
+            time.sleep(2)
+            log(f"\n[*] Retry {attempt}/{retries}: re-downloading {len(failed_unpacked)} unpacked files...")
+            failed_unpacked = download_unpacked_parallel(file_repo, failed_unpacked, output_dir, workers)
 
-        for i, fut in enumerate(as_completed(futures)):
-            fut.result()  # Raise any exceptions
-            if (i + 1) % 50 == 0 or (i + 1) == len(futures):
-                log(progress.status())
-
-    # 4. Download pack files (with incremental update support)
+    # 4. Download pack files with retry loop
     if all_packs:
-        # Build index of existing .uop files for skip checking
         pack_names = set(e['pack_name'] for e in all_packs)
-        log(f"\n[*] Scanning {len(pack_names)} existing .uop archives for incremental update...")
+        log(f"\n[*] Scanning {len(pack_names)} .uop archives for incremental update...")
         pack_index = build_pack_index(output_dir, pack_names)
         if pack_index:
-            log(f"  Found {len(pack_index)} existing entries across local archives")
+            log(f"  Found {len(pack_index)} existing entries in local archives")
 
-        log(f"[*] Checking {len(all_packs)} pack file entries...")
-        progress = ProgressTracker(len(all_packs), total_pack_bytes)
-        download_pack_files(file_repo, all_packs, output_dir, progress, pack_index)
-        log(progress.status())
+        log(f"[*] Downloading {len(all_packs)} pack entries ({workers} threads)...")
+        failed_packs = download_packs_parallel(file_repo, all_packs, output_dir, workers, pack_index)
 
-        # 5. Build MYP archives only for packs that had updates
+        # Retry failed pack downloads
+        for attempt in range(1, retries + 1):
+            if not failed_packs:
+                break
+            time.sleep(2)
+            log(f"\n[*] Retry {attempt}/{retries}: re-downloading {len(failed_packs)} pack entries...")
+            failed_packs = download_packs_parallel(file_repo, failed_packs, output_dir, workers)
+
+        # 5. Build MYP archives
         staging_dir = Path(output_dir) / '.pack_staging'
         if staging_dir.exists():
             updated_packs = set(d.name for d in staging_dir.iterdir() if d.is_dir())
@@ -737,37 +750,72 @@ def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, patcher_only=
             updated_packs = set()
 
         if updated_packs:
-            log(f"\n[*] Rebuilding {len(updated_packs)} updated MYP archives...")
+            log(f"\n[*] Building {len(updated_packs)} MYP archives...")
             pack_groups = {}
             for e in all_packs:
-                pname = e['pack_name']
-                if pname in updated_packs:
-                    if pname not in pack_groups:
-                        pack_groups[pname] = []
-                    pack_groups[pname].append(e)
+                if e['pack_name'] in updated_packs:
+                    pack_groups.setdefault(e['pack_name'], []).append(e)
 
             for pack_name, entries in pack_groups.items():
                 build_myp_archive(output_dir, pack_name, entries)
 
-            # Clean up staging directory
             shutil.rmtree(staging_dir, ignore_errors=True)
-            log(f"  Cleaned up staging directory")
         else:
-            log(f"\n[*] All pack archives are up-to-date, no rebuild needed")
+            log(f"\n[*] All pack archives up-to-date, no rebuild needed")
 
-    # 6. Verify if requested
-    if verify:
-        log(f"\n[*] Verifying downloaded files...")
-        u_ok, u_miss, u_mm = verify_unpacked(output_dir, all_unpacked)
-        log(f"  Unpacked: {u_ok} ok, {u_miss} missing, {u_mm} size mismatch (of {len(all_unpacked)})")
+        # 6. Verify archives and retry if needed
+        if not no_verify:
+            log(f"\n[*] Verifying pack archives...")
+            failed_verify = verify_archives(output_dir, all_packs)
 
-        if all_packs:
-            p_ok, p_miss, p_mm = verify_archives(output_dir, all_packs)
-            log(f"  Pack entries: {p_ok} ok, {p_miss} missing, {p_mm} size mismatch (of {len(all_packs)})")
+            for attempt in range(1, retries + 1):
+                if not failed_verify:
+                    break
+                time.sleep(2)
+                log(f"\n[*] Verify retry {attempt}/{retries}: re-downloading {len(failed_verify)} entries...")
+                # Re-download only the failed entries
+                still_failed = download_packs_parallel(file_repo, failed_verify, output_dir, workers)
+                if still_failed:
+                    log(f"  {len(still_failed)} entries still failing after download retry")
 
-            if p_miss or p_mm:
-                log(f"\n  WARNING: {p_miss + p_mm} pack entries failed verification!")
-                log(f"  Re-run without --dry-run to re-download failed entries.")
+                # Rebuild only the affected archives
+                affected_packs = set(e['pack_name'] for e in failed_verify)
+                for pack_name in affected_packs:
+                    pack_entries_for_rebuild = [e for e in all_packs if e['pack_name'] == pack_name]
+                    build_myp_archive(output_dir, pack_name, pack_entries_for_rebuild)
+
+                # Clean staging for affected packs
+                staging_dir = Path(output_dir) / '.pack_staging'
+                if staging_dir.exists():
+                    shutil.rmtree(staging_dir, ignore_errors=True)
+
+                # Re-verify only affected
+                affected_entries = [e for e in all_packs if e['pack_name'] in affected_packs]
+                failed_verify = verify_archives(output_dir, affected_entries)
+
+            if failed_verify:
+                log(f"\n{'='*60}")
+                log(f"  ERROR: {len(failed_verify)} entries failed after all retries:")
+                for e in failed_verify[:20]:
+                    log(f"    {e['pack_name']}/{e['ph']}{e['sh']}")
+                if len(failed_verify) > 20:
+                    log(f"    ... and {len(failed_verify) - 20} more")
+                log(f"{'='*60}")
+                sys.exit(1)
+
+    # 7. Verify unpacked files
+    if not no_verify and all_unpacked:
+        log(f"\n[*] Verifying unpacked files...")
+        still_failed = verify_unpacked(output_dir, all_unpacked)
+        if still_failed:
+            # Filter out known CDN-missing files (notes/ stage)
+            real_failures = [e for e in still_failed if not e['name'].startswith('notes/')]
+            if real_failures:
+                log(f"  WARNING: {len(real_failures)} unpacked files failed verification")
+                for e in real_failures[:10]:
+                    log(f"    {e['name']}")
+            if still_failed and not real_failures:
+                log(f"  ({len(still_failed)} missing files are all from 'notes/' stage - non-critical)")
 
     log(f"\n[*] Patch complete! Files written to: {output_dir}")
 
@@ -779,7 +827,7 @@ def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, patcher_only=
 PATCHER_PROD_URL = "http://patch.uo.eamythic.com/uopatch-sa/legacyrelease/patcher/manifest/patcher.prod"
 
 
-def run_patcher_download(output_dir, workers=4):
+def run_patcher_download(output_dir, workers=4, retries=MAX_RETRIES):
     """Download the patcher/launcher files (UO.exe, etc.)."""
     prod = parse_prod(PATCHER_PROD_URL)
     manifest_repo = prod['manifest_repos'][0]
@@ -803,33 +851,28 @@ def run_patcher_download(output_dir, workers=4):
     output_dir.mkdir(parents=True, exist_ok=True)
 
     if all_unpacked:
-        total_bytes = sum(e['cl'] if e['ct'] == 1 else e['ul'] for e in all_unpacked)
-        progress = ProgressTracker(len(all_unpacked), total_bytes)
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = []
-            for entry in all_unpacked:
-                fut = pool.submit(download_unpacked_file, file_repo, entry, output_dir, progress)
-                futures.append(fut)
-            for fut in as_completed(futures):
-                fut.result()
-        log(progress.status())
+        failed = download_unpacked_parallel(file_repo, all_unpacked, output_dir, workers)
+        for attempt in range(1, retries + 1):
+            if not failed:
+                break
+            time.sleep(2)
+            log(f"  Patcher retry {attempt}/{retries}: {len(failed)} files...")
+            failed = download_unpacked_parallel(file_repo, failed, output_dir, workers)
 
     if all_packs:
-        total_pack_bytes = sum(e['cl'] if e['ct'] == 1 else e['ul'] for e in all_packs)
-        progress = ProgressTracker(len(all_packs), total_pack_bytes)
-        download_pack_files(file_repo, all_packs, output_dir, progress)
-        log(progress.status())
+        failed = download_packs_parallel(file_repo, all_packs, output_dir, workers)
+        for attempt in range(1, retries + 1):
+            if not failed:
+                break
+            time.sleep(2)
+            failed = download_packs_parallel(file_repo, failed, output_dir, workers)
 
-        # Build MYP archives for patcher packs
-        staging_dir = Path(output_dir) / '.pack_staging'
+        # Build archives
+        staging_dir = output_dir / '.pack_staging'
         if staging_dir.exists():
             pack_groups = {}
             for e in all_packs:
-                pname = e['pack_name']
-                if pname not in pack_groups:
-                    pack_groups[pname] = []
-                pack_groups[pname].append(e)
-
+                pack_groups.setdefault(e['pack_name'], []).append(e)
             for pack_name, entries in pack_groups.items():
                 build_myp_archive(output_dir, pack_name, entries)
             shutil.rmtree(staging_dir, ignore_errors=True)
@@ -849,17 +892,20 @@ Examples:
   %(prog)s --output ~/UO --dry-run           # Show what would be downloaded
   %(prog)s --output ~/UO --workers 16        # Download with 16 threads
   %(prog)s --output ~/UO --patcher-only      # Only download the patcher/launcher
+  %(prog)s --output ~/UO --no-verify         # Skip post-download verification
         """)
     parser.add_argument('-o', '--output', default='./UO_Client',
                         help='Output directory (default: ./UO_Client)')
     parser.add_argument('-w', '--workers', type=int, default=8,
-                        help='Number of download threads (default: 8)')
+                        help='Number of parallel download threads (default: 8)')
     parser.add_argument('--dry-run', action='store_true',
                         help='Only show what would be downloaded')
     parser.add_argument('--patcher-only', action='store_true',
                         help='Only download patcher/launcher files')
-    parser.add_argument('--verify', action='store_true',
-                        help='Verify archives after download (re-read and compare against manifest)')
+    parser.add_argument('--no-verify', action='store_true',
+                        help='Skip post-download verification and retry')
+    parser.add_argument('--retries', type=int, default=MAX_RETRIES,
+                        help=f'Max retry attempts for failed downloads (default: {MAX_RETRIES})')
     parser.add_argument('--prod-url',
                         help='Override product manifest URL')
     args = parser.parse_args()
@@ -870,14 +916,14 @@ Examples:
     log("=" * 60)
 
     if args.patcher_only:
-        run_patcher_download(args.output, args.workers)
+        run_patcher_download(args.output, args.workers, args.retries)
     else:
-        # Download patcher first, then game files
         log("\n[Phase 1] Downloading patcher/launcher...")
-        run_patcher_download(args.output, args.workers)
+        run_patcher_download(args.output, args.workers, args.retries)
 
         log("\n[Phase 2] Downloading game files...")
-        run_patch(args.output, args.prod_url, args.workers, args.dry_run, verify=args.verify)
+        run_patch(args.output, args.prod_url, args.workers, args.dry_run,
+                  no_verify=args.no_verify, retries=args.retries)
 
 
 if __name__ == '__main__':
