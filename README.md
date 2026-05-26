@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/banner.webp" alt="UO Patcher" width="600">
+</p>
+
 # UO Patcher
 
 A Python tool to download and update the Ultima Online Classic Client directly from EA/Broadsword's public patch servers. No dependencies beyond Python 3.7+ stdlib.
