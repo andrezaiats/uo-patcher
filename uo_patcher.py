@@ -487,19 +487,14 @@ def download_packs_parallel(file_repo, entries, output_dir, workers, pack_index=
 def build_myp_archive(output_dir, pack_name, entries):
     """Build a MYP v5 archive from downloaded chunks.
 
-    MYP format (Mythic Package) — must match read_uop_index():
-      Header (28 bytes):
-        magic(4) + version(4) + signature(4) + first_block(8) + capacity(4) + count(4)
-      File table block:
-        block header (12 bytes): entry_count(4) + next_block_offset(8)
-        followed by up to `capacity` entries (34 bytes each)
-      Entry (34 bytes):
-        data_offset(8) + hdr_len(4) + comp_size(4) + decomp_size(4)
-        + file_hash(8) + adler32(4) + compression_flag(2)
+    Replicates the official EA patcher layout:
+      Header (28 bytes) + padding to offset 512
+      File table block at offset 512 (capacity entries + block header)
+      Data entries after file table
 
-    The official patcher decompresses data before writing to archives, so on-disk
-    entries have compression_flag=0 and comp_size == decomp_size.
-    The file_hash stores (sh << 32 | ph).
+    Entry format (34 bytes in file table):
+      data_offset(8) + hdr_len(4) + comp_size(4) + decomp_size(4)
+      + file_hash(8) + adler32(4) + compression_flag(2)
     """
     chunk_dir = Path(output_dir) / '.pack_staging' / pack_name
     if not chunk_dir.exists():
@@ -512,11 +507,17 @@ def build_myp_archive(output_dir, pack_name, entries):
 
     TABLE_ENTRY_SIZE = 34
     TABLE_BLOCK_SIZE = 1000
-    HEADER_SIZE = 28  # magic(4)+version(4)+sig(4)+offset(8)+capacity(4)+count(4)
-    BLOCK_HEADER_SIZE = 12  # entry_count(4)+next_block(8)
+    DATA_START = 0x200       # 512 — DefaultStartAddress from Mythic Package Editor
+    BLOCK_HEADER_SIZE = 12   # entry_count(4) + next_block(8)
+    TABLE_BLOCK_BYTES = BLOCK_HEADER_SIZE + TABLE_BLOCK_SIZE * TABLE_ENTRY_SIZE  # 34012
+    # Metadata header prepended to each data entry (v5 format).
+    # Official EA headers are 137 bytes: type(2)=4 + data_len(2)=133 + signature(133).
+    # ServUO/Ultima only reads hdr_len to skip past the header (offset + headerLength),
+    # never inspects the content, so we zero-fill the signature portion.
+    ENTRY_HEADER_LEN = 137
+    ENTRY_HEADER = struct.pack('<HH', 4, 133) + b'\x00' * 133  # type=4, len=133, zeroed data
 
-    # First pass: read chunks, decompress if needed, compute offsets
-    current_offset = HEADER_SIZE
+    # First pass: read chunks, decompress if needed
     file_records = []
     skipped = 0
 
@@ -543,14 +544,11 @@ def build_myp_archive(output_dir, pack_name, entries):
             log(f"    WARN: {ph:08x}{sh:08x} size mismatch: got {data_size}, manifest says {ul}")
 
         file_records.append({
-            'offset': current_offset,
             'ph': ph,
             'sh': sh,
             'data_size': data_size,
-            'decompressed_size': data_size,  # use actual size for both fields
             'file_data': file_data,
         })
-        current_offset += data_size
 
     if skipped:
         log(f"    {skipped} entries skipped due to missing chunks")
@@ -562,20 +560,36 @@ def build_myp_archive(output_dir, pack_name, entries):
         log(f"    ERROR: no valid entries for {pack_name}, skipping archive creation")
         return
 
-    first_table_offset = current_offset
+    # Layout (matches official EA patcher):
+    #   header(28) + pad(484) + entry0(hdr+data) + file_table + entry1..N(hdr+data)
+    # First data entry at offset 512, file table right after it.
+    first_entry_offset = DATA_START
+    entry_with_header = ENTRY_HEADER_LEN + file_records[0]['data_size']
+    first_table_offset = first_entry_offset + entry_with_header
+    remaining_data_offset = first_table_offset + num_table_blocks * TABLE_BLOCK_BYTES
+
+    # Assign offsets: entry 0 goes before file table, rest go after
+    file_records[0]['offset'] = first_entry_offset
+    current_offset = remaining_data_offset
+    for rec in file_records[1:]:
+        rec['offset'] = current_offset
+        current_offset += ENTRY_HEADER_LEN + rec['data_size']
 
     with open(out_path, 'wb') as f:
         # Header (28 bytes)
         f.write(b'MYP\x00')
         f.write(struct.pack('<I', 5))                      # version
-        f.write(struct.pack('<I', 0))                      # signature
+        f.write(struct.pack('<I', EA_MYP_SIGNATURE))       # signature (0xFD23EC43)
         f.write(struct.pack('<q', first_table_offset))     # first table block offset
         f.write(struct.pack('<I', TABLE_BLOCK_SIZE))       # capacity
         f.write(struct.pack('<I', num_entries))             # total file count
 
-        # File data
-        for rec in file_records:
-            f.write(rec['file_data'])
+        # Pad to DATA_START (512)
+        f.write(b'\x00' * (DATA_START - 28))
+
+        # First data entry (before file table, like official layout)
+        f.write(ENTRY_HEADER)
+        f.write(file_records[0]['file_data'])
 
         # File table blocks
         idx = 0
@@ -584,15 +598,13 @@ def build_myp_archive(output_dir, pack_name, entries):
             block_end = min(idx + TABLE_BLOCK_SIZE, num_entries)
             block_entries = file_records[block_start:block_end]
 
-            # Calculate next block offset before writing
-            # Current pos + block_header(12) + capacity*entry(34) = start of next block
             if block_num < num_table_blocks - 1:
-                next_block_offset = f.tell() + BLOCK_HEADER_SIZE + TABLE_BLOCK_SIZE * TABLE_ENTRY_SIZE
+                next_block_offset = first_table_offset + (block_num + 1) * TABLE_BLOCK_BYTES
             else:
                 next_block_offset = 0
 
-            # Block header: entry_count(4) + next_block_offset(8)
-            f.write(struct.pack('<I', len(block_entries)))
+            # Block header — write capacity as entry count (matches official format)
+            f.write(struct.pack('<I', TABLE_BLOCK_SIZE))
             f.write(struct.pack('<q', next_block_offset))
 
             # Entries (34 bytes each)
@@ -600,18 +612,23 @@ def build_myp_archive(output_dir, pack_name, entries):
                 file_hash = (rec['sh'] << 32) | rec['ph']
                 adler = zlib.adler32(rec['file_data']) & 0xFFFFFFFF if rec['file_data'] else 0
                 f.write(struct.pack('<q', rec['offset']))          # data offset
-                f.write(struct.pack('<I', 0))                      # header length (0)
-                f.write(struct.pack('<I', rec['data_size']))       # compressed size (== decomp, uncompressed on disk)
-                f.write(struct.pack('<I', rec['decompressed_size']))  # decompressed size
-                f.write(struct.pack('<Q', file_hash))              # file hash (sh<<32 | ph)
-                f.write(struct.pack('<I', adler))                  # adler32 checksum
-                f.write(struct.pack('<h', 0))                      # compression flag (0 = none)
+                f.write(struct.pack('<I', ENTRY_HEADER_LEN))       # header length
+                f.write(struct.pack('<I', rec['data_size']))       # compressed size
+                f.write(struct.pack('<I', rec['data_size']))       # decompressed size
+                f.write(struct.pack('<Q', file_hash))              # file hash
+                f.write(struct.pack('<I', adler))                  # adler32
+                f.write(struct.pack('<h', 0))                      # compression flag
 
             # Pad remaining slots in block with zeroes
             remaining = TABLE_BLOCK_SIZE - len(block_entries)
             f.write(b'\x00' * (remaining * TABLE_ENTRY_SIZE))
 
             idx = block_end
+
+        # Remaining data entries (after file table)
+        for rec in file_records[1:]:
+            f.write(ENTRY_HEADER)
+            f.write(rec['file_data'])
 
     log(f"  Built {pack_name}: {out_path.stat().st_size / 1024 / 1024:.1f} MB, {num_entries} files")
 
