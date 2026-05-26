@@ -301,6 +301,8 @@ def build_pack_index(output_dir, pack_names):
             continue
         index = read_uop_index(str(uop_path))
         for (ph, sh), decomp_size in index.items():
+            combined[(pack_name, f"{ph:08x}", f"{sh:08x}")] = decomp_size
+            # Also store without padding since manifest ph/sh may vary
             combined[(pack_name, f"{ph:x}", f"{sh:x}")] = decomp_size
     return combined
 
