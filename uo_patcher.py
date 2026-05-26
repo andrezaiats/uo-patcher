@@ -227,6 +227,26 @@ def collect_files(manifest_repo, pkg_rpath, manifest_name):
 
 
 # ---------------------------------------------------------------------------
+EA_MYP_SIGNATURE = 0xFD23EC43
+
+
+def is_official_uop(path):
+    """Check if a .uop file has the official EA MYP signature.
+
+    Our builder writes sig=0; official EA files have sig=0xFD23EC43.
+    """
+    try:
+        with open(path, 'rb') as f:
+            magic = f.read(4)
+            if magic != b'MYP\x00':
+                return False
+            f.read(4)  # version
+            sig = struct.unpack('<I', f.read(4))[0]
+            return sig == EA_MYP_SIGNATURE
+    except (OSError, struct.error):
+        return False
+
+
 # UOP (MYP) archive index reader - for incremental updates
 # ---------------------------------------------------------------------------
 
@@ -347,7 +367,12 @@ def _download_one_unpacked(file_repo, entry, output_dir):
 
     out_path = Path(output_dir) / name
     if out_path.exists() and out_path.stat().st_size == ul:
-        return (entry, None, True)  # (entry, error, was_skipped)
+        # Self-healing: force re-download .uop files that lack the EA signature
+        # (produced by our old builder instead of downloaded from CDN)
+        if out_path.suffix == '.uop' and not is_official_uop(str(out_path)):
+            pass  # fall through to re-download
+        else:
+            return (entry, None, True)  # (entry, error, was_skipped)
 
     h = filename_hash(name)
     url = f"{file_repo}base/unpacked/{h}"
@@ -725,7 +750,23 @@ def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, no_verify=Fal
             log(f"\n[*] Retry {attempt}/{retries}: re-downloading {len(failed_unpacked)} unpacked files...")
             failed_unpacked = download_unpacked_parallel(file_repo, failed_unpacked, output_dir, workers)
 
-    # 4. Download pack files with retry loop
+    # 4. Filter pack entries: skip packs whose .uop was already downloaded as a valid EA archive
+    official_uops = set()
+    for e in all_unpacked:
+        if e['name'].endswith('.uop'):
+            p = output_dir / e['name']
+            if p.exists() and p.stat().st_size == e['ul'] and is_official_uop(str(p)):
+                official_uops.add(e['name'])
+
+    if official_uops:
+        before = len(all_packs)
+        all_packs = [e for e in all_packs if e['pack_name'] not in official_uops]
+        if all_packs:
+            log(f"\n[*] Skipped {before - len(all_packs)} pack entries ({len(official_uops)} valid EA archives)")
+        else:
+            log(f"\n[*] All {len(official_uops)} pack archives already present as valid EA downloads")
+
+    # 5. Download remaining pack files with retry loop
     if all_packs:
         pack_names = set(e['pack_name'] for e in all_packs)
         log(f"\n[*] Scanning {len(pack_names)} .uop archives for incremental update...")
@@ -744,12 +785,21 @@ def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, no_verify=Fal
             log(f"\n[*] Retry {attempt}/{retries}: re-downloading {len(failed_packs)} pack entries...")
             failed_packs = download_packs_parallel(file_repo, failed_packs, output_dir, workers)
 
-        # 5. Build MYP archives
+        # 6. Build MYP archives (only for packs without valid EA unpacked downloads)
         staging_dir = Path(output_dir) / '.pack_staging'
         if staging_dir.exists():
             updated_packs = set(d.name for d in staging_dir.iterdir() if d.is_dir())
         else:
             updated_packs = set()
+
+        # Don't rebuild archives that exist as valid EA downloads
+        for pack_name in list(updated_packs):
+            if pack_name in official_uops:
+                updated_packs.discard(pack_name)
+                # Clean staging for this pack
+                pack_staging = staging_dir / pack_name
+                if pack_staging.exists():
+                    shutil.rmtree(pack_staging, ignore_errors=True)
 
         if updated_packs:
             log(f"\n[*] Building {len(updated_packs)} MYP archives...")
@@ -759,11 +809,15 @@ def run_patch(output_dir, prod_url=None, workers=8, dry_run=False, no_verify=Fal
                     pack_groups.setdefault(e['pack_name'], []).append(e)
 
             for pack_name, entries in pack_groups.items():
+                if pack_name not in official_uops:
+                    log(f"  WARNING: {pack_name} has no EA unpacked download, building from chunks")
                 build_myp_archive(output_dir, pack_name, entries)
 
             shutil.rmtree(staging_dir, ignore_errors=True)
         else:
             log(f"\n[*] All pack archives up-to-date, no rebuild needed")
+            if staging_dir.exists():
+                shutil.rmtree(staging_dir, ignore_errors=True)
 
         # 6. Verify archives and retry if needed
         if not no_verify:
@@ -862,19 +916,31 @@ def run_patcher_download(output_dir, workers=4, retries=MAX_RETRIES):
             failed = download_unpacked_parallel(file_repo, failed, output_dir, workers)
 
     if all_packs:
-        failed = download_packs_parallel(file_repo, all_packs, output_dir, workers)
-        for attempt in range(1, retries + 1):
-            if not failed:
-                break
-            time.sleep(2)
-            failed = download_packs_parallel(file_repo, failed, output_dir, workers)
+        # Filter out packs whose .uop was already downloaded as valid EA archive
+        official_uops = set()
+        for e in all_unpacked:
+            if e['name'].endswith('.uop') or e['name'].endswith('.myp'):
+                p = output_dir / e['name']
+                if p.exists() and p.stat().st_size == e['ul'] and is_official_uop(str(p)):
+                    official_uops.add(e['name'])
+        if official_uops:
+            all_packs = [e for e in all_packs if e['pack_name'] not in official_uops]
 
-        # Build archives
+        if all_packs:
+            failed = download_packs_parallel(file_repo, all_packs, output_dir, workers)
+            for attempt in range(1, retries + 1):
+                if not failed:
+                    break
+                time.sleep(2)
+                failed = download_packs_parallel(file_repo, failed, output_dir, workers)
+
+        # Build archives (only non-official)
         staging_dir = output_dir / '.pack_staging'
         if staging_dir.exists():
             pack_groups = {}
             for e in all_packs:
-                pack_groups.setdefault(e['pack_name'], []).append(e)
+                if e['pack_name'] not in official_uops:
+                    pack_groups.setdefault(e['pack_name'], []).append(e)
             for pack_name, entries in pack_groups.items():
                 build_myp_archive(output_dir, pack_name, entries)
             shutil.rmtree(staging_dir, ignore_errors=True)
