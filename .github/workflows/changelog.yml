@@ -1,0 +1,38 @@
+name: Changelog
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - CHANGELOG.md
+
+permissions:
+  contents: write
+
+concurrency:
+  group: changelog-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  changelog:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Regenerate CHANGELOG.md
+        run: bash scripts/generate-changelog.sh
+
+      - name: Commit if changed
+        run: |
+          if git diff --quiet -- CHANGELOG.md; then
+            echo "CHANGELOG.md unchanged, nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add CHANGELOG.md
+          git commit -m "docs: update changelog [skip ci]"
+          git push
