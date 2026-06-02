@@ -3,6 +3,12 @@
 All notable changes to this project will be documented in this file.
 Format follows [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/).
 
+## 2026-06-02
+
+### CI
+
+- add changelog generation and commit lint workflows ([063c592](https://github.com/andrezaiats/uo-patcher/commit/063c592727f7985892d22733c85b5edb2486431e))
+
 ## 2026-05-26
 
 ### Documentation
