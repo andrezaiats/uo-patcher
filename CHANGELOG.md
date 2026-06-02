@@ -5,6 +5,11 @@ Format follows [Conventional Commits](https://www.conventionalcommits.org/en/v1.
 
 ## 2026-06-02
 
+### Documentation
+
+- replace banner with terminal demo gif ([3bc6a2b](https://github.com/andrezaiats/uo-patcher/commit/3bc6a2be6e5119ac44c2346a888f19ea5596405a))
+- update changelog [skip ci] ([9332bd1](https://github.com/andrezaiats/uo-patcher/commit/9332bd1611a0199cf9474f9afbd569ca4315c6f9))
+
 ### CI
 
 - add changelog generation and commit lint workflows ([063c592](https://github.com/andrezaiats/uo-patcher/commit/063c592727f7985892d22733c85b5edb2486431e))
